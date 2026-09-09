@@ -4,7 +4,7 @@
 
 *It is meant to run on Fedora (including XFCE) and other Linux desktops.*
 
-[![Crates.io](https://img.shields.io/crates/v/md-echo.svg)](https://crates.io/crates/alarum)
+[![Crates.io](https://img.shields.io/crates/v/alarum.svg)](https://crates.io/crates/alarum)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-stable-orange.svg)](https://www.rust-lang.org)
 
