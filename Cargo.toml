@@ -1,0 +1,30 @@
+[package]
+name = "alarum"
+version = "0.1.0"
+edition = "2021"
+description = "A simple desktop alarm clock with sound, messages, and snooze"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/fibnas/alarum"
+categories = ["GUI"]
+keywords = ["gui", "clock", "organization", "productivity", "alarm"]
+exclude = ["target/", "entries.json", "screenshots/"]
+
+[dependencies]
+chrono = { version = "=0.4.38", features = ["clock", "serde"] }
+dirs = "=5.0.1"
+eframe = "=0.26.2"
+egui = "=0.26.2"
+serde = { version = "=1.0.203", features = ["derive"] }
+serde_json = "=1.0.117"
+uuid = { version = "=1.8.0", features = ["v4", "serde"] }
+
+[[bin]]
+name = "alarum"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true
