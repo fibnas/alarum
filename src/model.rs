@@ -1,6 +1,9 @@
-use chrono::{DateTime, Datelike, Duration, Local, NaiveTime, TimeZone, Timelike, Weekday};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveTime, TimeZone, Timelike, Weekday};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// How far back a due check may look after sleep or a stall.
+pub const CATCH_UP: Duration = Duration::hours(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Repeat {
@@ -74,6 +77,17 @@ impl Alarm {
         }
     }
 
+    pub fn occurrence_on(&self, date: NaiveDate) -> Option<DateTime<Local>> {
+        if !self.repeat.matches(date.weekday()) {
+            return None;
+        }
+        let naive = date.and_time(NaiveTime::from_hms_opt(self.hour, self.minute, 0)?);
+        Local
+            .from_local_datetime(&naive)
+            .earliest()
+            .or_else(|| Local.from_local_datetime(&naive).latest())
+    }
+
     /// Next time this alarm should ring, if enabled.
     pub fn next_trigger(&self, now: DateTime<Local>) -> Option<DateTime<Local>> {
         if !self.enabled {
@@ -86,63 +100,61 @@ impl Alarm {
             }
         }
 
-        // Look up to 8 days ahead so weekend/weekday rules resolve.
         for day_offset in 0..8 {
             let candidate_date = now.date_naive() + Duration::days(day_offset);
-            let weekday = candidate_date.weekday();
-            if !self.repeat.matches(weekday) {
-                continue;
-            }
-            let naive = candidate_date.and_time(NaiveTime::from_hms_opt(self.hour, self.minute, 0)?);
-            if let Some(candidate) = Local.from_local_datetime(&naive).earliest() {
-                // Same-minute already handled this cycle? Skip to next occurrence.
-                let already = self
-                    .last_fired
-                    .map(|fired| fired >= candidate && fired.date_naive() == candidate.date_naive())
-                    .unwrap_or(false);
-                if candidate > now && !already {
-                    return Some(candidate);
-                }
-                if candidate <= now && day_offset == 0 && !already && self.repeat == Repeat::Once {
-                    // A once-alarm whose time is still "now" (same minute) should fire.
-                    if now.hour() == self.hour && now.minute() == self.minute {
-                        return Some(candidate);
-                    }
-                }
-                if candidate <= now {
+            if let Some(candidate) = self.occurrence_on(candidate_date) {
+                let already = self.last_fired.map(|fired| fired >= candidate).unwrap_or(false);
+                if already {
                     continue;
                 }
-                return Some(candidate);
+                if candidate > now {
+                    return Some(candidate);
+                }
             }
         }
         None
     }
 
-    pub fn should_fire(&self, now: DateTime<Local>) -> bool {
+    /// True when a scheduled (or snooze) time falls in `(last_poll, now]` and within `CATCH_UP`.
+    pub fn should_fire(&self, last_poll: DateTime<Local>, now: DateTime<Local>) -> bool {
         if !self.enabled {
             return false;
         }
+        if now <= last_poll {
+            return false;
+        }
+
+        let grace_start = now - CATCH_UP;
+        let window_lo = if last_poll > grace_start { last_poll } else { grace_start };
 
         if let Some(until) = self.snooze_until {
-            if now >= until {
-                let already = self.last_fired.map(|f| f >= until).unwrap_or(false);
-                return !already;
+            if until > now {
+                return false;
             }
-            return false;
+            let already = self.last_fired.map(|fired| fired >= until).unwrap_or(false);
+            if !already && until > window_lo && until <= now {
+                return true;
+            }
+            // Snooze already consumed or outside the window; do not also
+            // fire the original clock time in the same pass.
+            if !already {
+                return false;
+            }
         }
 
-        if !self.repeat.matches(now.weekday()) {
-            return false;
+        let start_date = window_lo.date_naive() - Duration::days(1);
+        let end_date = now.date_naive();
+        let mut day = start_date;
+        while day <= end_date {
+            if let Some(scheduled) = self.occurrence_on(day) {
+                let already = self.last_fired.map(|fired| fired >= scheduled).unwrap_or(false);
+                if !already && scheduled > window_lo && scheduled <= now {
+                    return true;
+                }
+            }
+            day += Duration::days(1);
         }
-
-        if now.hour() != self.hour || now.minute() != self.minute {
-            return false;
-        }
-
-        match self.last_fired {
-            None => true,
-            Some(fired) => fired.date_naive() != now.date_naive() || fired.hour() != now.hour() || fired.minute() != now.minute(),
-        }
+        false
     }
 }
 
@@ -153,6 +165,9 @@ pub struct AlarmStore {
     /// When true, clocks and editors use 12-hour time with AM/PM.
     #[serde(default)]
     pub use_12_hour: bool,
+    /// Last time the running app sampled the clock. Used for catch-up after stalls.
+    #[serde(default)]
+    pub last_checked: Option<DateTime<Local>>,
 }
 
 impl AlarmStore {
@@ -161,6 +176,7 @@ impl AlarmStore {
             alarms: Vec::new(),
             default_snooze_minutes: 5,
             use_12_hour: false,
+            last_checked: None,
         }
     }
 }
@@ -175,7 +191,11 @@ pub fn to_12_hour(hour24: u32) -> (u32, bool) {
 /// Convert a 1–12 hour plus AM/PM to 0–23.
 pub fn to_24_hour(hour12: u32, is_pm: bool) -> u32 {
     let base = if hour12 == 12 { 0 } else { hour12 % 12 };
-    if is_pm { base + 12 } else { base }
+    if is_pm {
+        base + 12
+    } else {
+        base
+    }
 }
 
 pub fn format_hm(hour: u32, minute: u32, use_12_hour: bool) -> String {
@@ -200,5 +220,142 @@ pub fn format_next(dt: DateTime<Local>, use_12_hour: bool) -> String {
         dt.format("%a %I:%M %p").to_string()
     } else {
         dt.format("%a %H:%M").to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> DateTime<Local> {
+        Local
+            .with_ymd_and_hms(year, month, day, hour, minute, second)
+            .single()
+            .or_else(|| Local.with_ymd_and_hms(year, month, day, hour, minute, second).earliest())
+            .expect("valid local datetime")
+    }
+
+    fn alarm_at(hour: u32, minute: u32, repeat: Repeat) -> Alarm {
+        let mut alarm = Alarm::new(hour, minute);
+        alarm.repeat = repeat;
+        alarm
+    }
+
+    #[test]
+    fn twelve_hour_roundtrip() {
+        assert_eq!(to_12_hour(0), (12, false));
+        assert_eq!(to_12_hour(1), (1, false));
+        assert_eq!(to_12_hour(12), (12, true));
+        assert_eq!(to_12_hour(15), (3, true));
+        assert_eq!(to_12_hour(23), (11, true));
+        assert_eq!(to_24_hour(12, false), 0);
+        assert_eq!(to_24_hour(12, true), 12);
+        assert_eq!(to_24_hour(3, true), 15);
+        assert_eq!(format_hm(15, 5, true), "3:05 PM");
+        assert_eq!(format_hm(15, 5, false), "15:05");
+    }
+
+    #[test]
+    fn fires_in_the_due_minute() {
+        let alarm = alarm_at(8, 0, Repeat::Once);
+        let last = at(2026, 9, 9, 7, 59, 50);
+        let now = at(2026, 9, 9, 8, 0, 10);
+        assert!(alarm.should_fire(last, now));
+    }
+
+    #[test]
+    fn catches_up_after_sleep_across_the_minute() {
+        let alarm = alarm_at(8, 0, Repeat::Daily);
+        let last = at(2026, 9, 9, 7, 59, 0);
+        let now = at(2026, 9, 9, 8, 1, 0);
+        assert!(alarm.should_fire(last, now));
+    }
+
+    #[test]
+    fn does_not_fire_outside_catch_up_window() {
+        let alarm = alarm_at(8, 0, Repeat::Daily);
+        let last = at(2026, 9, 8, 10, 0, 0);
+        let now = at(2026, 9, 9, 12, 0, 0);
+        assert!(!alarm.should_fire(last, now));
+    }
+
+    #[test]
+    fn does_not_refire_same_occurrence() {
+        let mut alarm = alarm_at(8, 0, Repeat::Daily);
+        alarm.last_fired = Some(at(2026, 9, 9, 8, 0, 5));
+        let last = at(2026, 9, 9, 8, 0, 10);
+        let now = at(2026, 9, 9, 8, 0, 40);
+        assert!(!alarm.should_fire(last, now));
+    }
+
+    #[test]
+    fn weekday_alarm_skips_saturday() {
+        let alarm = alarm_at(8, 0, Repeat::Weekdays);
+        let last = at(2026, 9, 11, 23, 59, 0); // Friday night
+        let now = at(2026, 9, 12, 8, 0, 30); // Saturday
+        assert!(!alarm.should_fire(last, now));
+        assert_eq!(
+            alarm.next_trigger(now).map(|t| t.weekday()),
+            Some(Weekday::Mon)
+        );
+    }
+
+    #[test]
+    fn weekend_alarm_skips_wednesday() {
+        let alarm = alarm_at(9, 30, Repeat::Weekends);
+        let last = at(2026, 9, 9, 9, 29, 0);
+        let now = at(2026, 9, 9, 9, 30, 10);
+        assert!(!alarm.should_fire(last, now));
+    }
+
+    #[test]
+    fn midnight_boundary() {
+        let alarm = alarm_at(0, 0, Repeat::Daily);
+        let last = at(2026, 9, 9, 23, 59, 0);
+        let now = at(2026, 9, 10, 0, 0, 15);
+        assert!(alarm.should_fire(last, now));
+    }
+
+    #[test]
+    fn snooze_due_uses_snooze_time_not_clock_time() {
+        let mut alarm = alarm_at(8, 0, Repeat::Once);
+        alarm.last_fired = Some(at(2026, 9, 9, 8, 0, 2));
+        alarm.snooze_until = Some(at(2026, 9, 9, 8, 5, 0));
+        let last = at(2026, 9, 9, 8, 4, 50);
+        let now = at(2026, 9, 9, 8, 5, 2);
+        assert!(alarm.should_fire(last, now));
+    }
+
+    #[test]
+    fn snooze_in_the_future_does_not_fire() {
+        let mut alarm = alarm_at(8, 0, Repeat::Once);
+        alarm.snooze_until = Some(at(2026, 9, 9, 8, 10, 0));
+        let last = at(2026, 9, 9, 8, 0, 0);
+        let now = at(2026, 9, 9, 8, 1, 0);
+        assert!(!alarm.should_fire(last, now));
+        assert_eq!(
+            alarm.next_trigger(now),
+            Some(at(2026, 9, 9, 8, 10, 0))
+        );
+    }
+
+    #[test]
+    fn disabled_alarm_never_fires() {
+        let mut alarm = alarm_at(8, 0, Repeat::Daily);
+        alarm.enabled = false;
+        let last = at(2026, 9, 9, 7, 59, 0);
+        let now = at(2026, 9, 9, 8, 0, 10);
+        assert!(!alarm.should_fire(last, now));
+        assert!(alarm.next_trigger(now).is_none());
+    }
+
+    #[test]
+    fn next_trigger_skips_consumed_today() {
+        let mut alarm = alarm_at(8, 0, Repeat::Daily);
+        alarm.last_fired = Some(at(2026, 9, 9, 8, 0, 1));
+        let now = at(2026, 9, 9, 8, 1, 0);
+        let next = alarm.next_trigger(now).expect("tomorrow");
+        assert_eq!(next.date_naive(), NaiveDate::from_ymd_opt(2026, 9, 10).unwrap());
+        assert_eq!(next.hour(), 8);
     }
 }

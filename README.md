@@ -26,11 +26,13 @@
 
 The app checks the clock only while it is running. Leave the window open (it can stay in the background).
 
+If the machine sleeps through an alarm time, Alarum will still ring when it wakes, as long as the app was running and the missed time is within the last two hours. Two alarms set for the same minute are queued. A one-shot alarm is consumed when it fires, not only when you dismiss it.
+
 ---
 
 ## Installation
 
-### Cargo:
+### Cargo
 
 ```bash
 cargo install alarum
@@ -73,7 +75,9 @@ The binary will be at `target/release/alarum`.
 4. Click **Test sound** if you want to hear it first.
 5. Save, and keep Alarum running.
 
-When an alarm fires, the window comes forward with your message plus **Snooze** and **Dismiss**. A one-shot alarm turns itself off after dismiss; repeating alarms stay enabled.
+When an alarm fires, the window comes forward with your message plus **Snooze** and **Dismiss**. A one-shot alarm turns itself off when it fires; repeating alarms stay enabled.
+
+If `~/.config/alarum/alarms.json` cannot be parsed, Alarum starts empty and leaves a `alarms.json.corrupt-*` copy next to the original instead of overwriting it.
 
 ---
 

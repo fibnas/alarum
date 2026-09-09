@@ -16,37 +16,59 @@ pub struct AlarumApp {
     store: AlarmStore,
     editor: Option<Alarm>,
     editor_is_new: bool,
+    editor_custom_sound: bool,
+    editor_stashed_sound: String,
     ringing_id: Option<Uuid>,
+    pending: Vec<Uuid>,
     player: Option<SoundPlayer>,
     status: String,
 }
 
 impl AlarumApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        let mut store = storage::load();
+        let loaded = storage::load();
+        let mut store = loaded.store;
         if store.default_snooze_minutes == 0 {
             store.default_snooze_minutes = 5;
         }
+        // First launch: do not dump every alarm due in the last two hours.
+        if store.last_checked.is_none() {
+            store.last_checked = Some(Local::now());
+        }
+        let status = loaded.warning.unwrap_or_else(|| {
+            "Alarms are checked while this window is running.".to_string()
+        });
         Self {
             store,
             editor: None,
             editor_is_new: false,
+            editor_custom_sound: false,
+            editor_stashed_sound: String::new(),
             ringing_id: None,
+            pending: Vec::new(),
             player: None,
-            status: "Alarms are checked while this window is running.".to_string(),
+            status,
         }
     }
 
-    fn persist(&self) {
-        storage::save(&self.store);
+    fn persist(&mut self) {
+        if let Err(err) = storage::save(&self.store) {
+            self.status = err;
+        }
+    }
+
+    fn open_editor(&mut self, alarm: Alarm, is_new: bool) {
+        self.editor_custom_sound = !alarm.sound_path.trim().is_empty();
+        self.editor_stashed_sound = alarm.sound_path.clone();
+        self.editor_is_new = is_new;
+        self.editor = Some(alarm);
     }
 
     fn add_alarm(&mut self) {
         let now = Local::now();
         let mut alarm = Alarm::new(now.hour(), now.minute());
         alarm.snooze_minutes = self.store.default_snooze_minutes.max(1);
-        self.editor_is_new = true;
-        self.editor = Some(alarm);
+        self.open_editor(alarm, true);
     }
 
     fn start_ringing(&mut self, id: Uuid) {
@@ -54,18 +76,26 @@ impl AlarumApp {
             return;
         }
         if let Some(alarm) = self.store.alarms.iter_mut().find(|a| a.id == id) {
-            alarm.last_fired = Some(Local::now());
+            let now = Local::now();
+            alarm.last_fired = Some(now);
             alarm.snooze_until = None;
+            if alarm.repeat == Repeat::Once {
+                alarm.enabled = false;
+            }
             let label = alarm.display_name();
             let sound = if alarm.sound_path.trim().is_empty() {
                 None
             } else {
                 Some(alarm.sound_path.clone())
             };
+            if let Some(mut player) = self.player.take() {
+                player.stop();
+            }
             self.player = Some(SoundPlayer::play(sound.as_deref().map(Path::new)));
             audio::notify("Alarm", &label);
             self.status = format!("Ringing: {label}");
             self.ringing_id = Some(id);
+            self.pending.retain(|pending| *pending != id);
             self.persist();
         }
     }
@@ -79,12 +109,14 @@ impl AlarumApp {
                     alarm.enabled = false;
                 }
             }
+            self.pending.retain(|pending| *pending != id);
         }
         if let Some(mut player) = self.player.take() {
             player.stop();
         }
         self.status = "Alarm dismissed.".to_string();
         self.persist();
+        self.ring_next_pending();
     }
 
     fn snooze(&mut self) {
@@ -96,28 +128,47 @@ impl AlarumApp {
                 alarm.enabled = true;
                 self.status = format!("Snoozed for {minutes} minutes.");
             }
+            self.pending.retain(|pending| *pending != id);
         }
         if let Some(mut player) = self.player.take() {
             player.stop();
         }
         self.persist();
+        self.ring_next_pending();
     }
 
-    fn poll_alarms(&mut self) {
-        if self.ringing_id.is_some() {
-            return;
+    fn ring_next_pending(&mut self) {
+        while let Some(id) = self.pending.first().copied() {
+            if self.store.alarms.iter().any(|alarm| alarm.id == id && alarm.enabled) {
+                self.start_ringing(id);
+                return;
+            }
+            self.pending.remove(0);
         }
-        let now = Local::now();
-        let due: Vec<Uuid> = self
+    }
+
+    fn enqueue_due(&mut self, last_poll: chrono::DateTime<Local>, now: chrono::DateTime<Local>) {
+        let mut due: Vec<Uuid> = self
             .store
             .alarms
             .iter()
-            .filter(|a| a.should_fire(now))
-            .map(|a| a.id)
+            .filter(|alarm| alarm.should_fire(last_poll, now))
+            .map(|alarm| alarm.id)
             .collect();
-        if let Some(id) = due.into_iter().next() {
-            self.start_ringing(id);
+        due.retain(|id| self.ringing_id != Some(*id) && !self.pending.contains(id));
+        self.pending.extend(due);
+    }
+
+    fn poll_alarms(&mut self) {
+        let now = Local::now();
+        let last_poll = self.store.last_checked.unwrap_or(now);
+        self.enqueue_due(last_poll, now);
+        self.store.last_checked = Some(now);
+
+        if self.ringing_id.is_some() {
+            return;
         }
+        self.ring_next_pending();
     }
 }
 
@@ -155,12 +206,20 @@ impl eframe::App for AlarumApp {
                     ui.add_space(12.0);
                     ui.vertical(|ui| {
                         ui.label(RichText::new("Alarum").size(22.0).color(accent).strong());
-                        ui.label(RichText::new("Keep this window open so alarms can ring.").size(12.0).color(muted));
+                        ui.label(
+                            RichText::new("Keep this window open so alarms can ring.")
+                                .size(12.0)
+                                .color(muted),
+                        );
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.add_space(12.0);
                         let clock = model::format_datetime(Local::now(), self.store.use_12_hour);
-                        ui.label(RichText::new(clock).font(FontId::monospace(20.0)).color(Color32::WHITE));
+                        ui.label(
+                            RichText::new(clock)
+                                .font(FontId::monospace(20.0))
+                                .color(Color32::WHITE),
+                        );
                     });
                 });
             });
@@ -192,7 +251,10 @@ impl eframe::App for AlarumApp {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui
-                    .add(egui::Button::new(RichText::new("  +  Add alarm  ").size(16.0).color(Color32::BLACK)).fill(accent))
+                    .add(
+                        egui::Button::new(RichText::new("  +  Add alarm  ").size(16.0).color(Color32::BLACK))
+                            .fill(accent),
+                    )
                     .clicked()
                 {
                     self.add_alarm();
@@ -200,7 +262,10 @@ impl eframe::App for AlarumApp {
                 ui.add_space(16.0);
                 ui.label("Default snooze:");
                 let mut snooze = self.store.default_snooze_minutes.max(1);
-                if ui.add(egui::DragValue::new(&mut snooze).suffix(" min").clamp_range(1..=60)).changed() {
+                if ui
+                    .add(egui::DragValue::new(&mut snooze).suffix(" min").clamp_range(1..=60))
+                    .changed()
+                {
                     self.store.default_snooze_minutes = snooze;
                     self.persist();
                 }
@@ -224,7 +289,11 @@ impl eframe::App for AlarumApp {
                 ui.add_space(48.0);
                 ui.vertical_centered(|ui| {
                     ui.label(RichText::new("No alarms yet").size(20.0).color(muted));
-                    ui.label(RichText::new("Add one and leave Alarum running.").size(14.0).color(muted));
+                    ui.label(
+                        RichText::new("Add one and leave Alarum running.")
+                            .size(14.0)
+                            .color(muted),
+                    );
                 });
                 return;
             }
@@ -232,73 +301,84 @@ impl eframe::App for AlarumApp {
             let mut edit_id = None;
             let mut delete_id = None;
             let mut persist = false;
+            let use_12 = self.store.use_12_hour;
 
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                for alarm in &mut self.store.alarms {
-                    let use_12 = self.store.use_12_hour;
-                    let next = alarm
-                        .next_trigger(Local::now())
-                        .map(|t| model::format_next(t, use_12))
-                        .unwrap_or_else(|| "—".to_string());
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for alarm in &mut self.store.alarms {
+                        let next = alarm
+                            .next_trigger(Local::now())
+                            .map(|t| model::format_next(t, use_12))
+                            .unwrap_or_else(|| "—".to_string());
 
-                    let (rect, _resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 78.0), Sense::hover());
-                    ui.painter().rect_filled(rect, 8.0, card);
-                    ui.painter().rect_stroke(rect, 8.0, Stroke::new(1.0_f32, Color32::from_rgb(58, 62, 74)));
+                        let (rect, _resp) =
+                            ui.allocate_exact_size(Vec2::new(ui.available_width(), 78.0), Sense::hover());
+                        ui.painter().rect_filled(rect, 8.0, card);
+                        ui.painter().rect_stroke(
+                            rect,
+                            8.0,
+                            Stroke::new(1.0_f32, Color32::from_rgb(58, 62, 74)),
+                        );
 
-                    let mut child = ui.child_ui(rect.shrink2(Vec2::new(12.0, 8.0)), *ui.layout());
-                    child.horizontal(|ui| {
-                        if ui.add(egui::Checkbox::without_text(&mut alarm.enabled)).changed() {
-                            persist = true;
-                        }
-                        ui.add_space(8.0);
-                        ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(alarm.time_label_for(use_12))
-                                        .font(FontId::monospace(28.0))
-                                        .color(if alarm.enabled { Color32::WHITE } else { muted })
-                                        .strong(),
-                                );
-                                ui.add_space(10.0);
-                                ui.vertical(|ui| {
-                                    ui.add_space(4.0);
+                        let mut child = ui.child_ui(rect.shrink2(Vec2::new(12.0, 8.0)), *ui.layout());
+                        child.horizontal(|ui| {
+                            if ui.add(egui::Checkbox::without_text(&mut alarm.enabled)).changed() {
+                                persist = true;
+                            }
+                            ui.add_space(8.0);
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
                                     ui.label(
-                                        RichText::new(alarm.display_name())
-                                            .size(16.0)
-                                            .color(if alarm.enabled { Color32::from_rgb(230, 232, 240) } else { muted }),
+                                        RichText::new(alarm.time_label_for(use_12))
+                                            .font(FontId::monospace(28.0))
+                                            .color(if alarm.enabled { Color32::WHITE } else { muted })
+                                            .strong(),
                                     );
-                                    ui.label(
-                                        RichText::new(format!("{}  ·  next {}", alarm.repeat.label(), next))
-                                            .size(12.0)
-                                            .color(muted),
-                                    );
+                                    ui.add_space(10.0);
+                                    ui.vertical(|ui| {
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            RichText::new(alarm.display_name()).size(16.0).color(
+                                                if alarm.enabled {
+                                                    Color32::from_rgb(230, 232, 240)
+                                                } else {
+                                                    muted
+                                                },
+                                            ),
+                                        );
+                                        ui.label(
+                                            RichText::new(format!("{}  ·  next {}", alarm.repeat.label(), next))
+                                                .size(12.0)
+                                                .color(muted),
+                                        );
+                                    });
                                 });
                             });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button("Delete").clicked() {
+                                    delete_id = Some(alarm.id);
+                                }
+                                if ui.button("Edit").clicked() {
+                                    edit_id = Some(alarm.id);
+                                }
+                            });
                         });
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.button("Delete").clicked() {
-                                delete_id = Some(alarm.id);
-                            }
-                            if ui.button("Edit").clicked() {
-                                edit_id = Some(alarm.id);
-                            }
-                        });
-                    });
-                    ui.add_space(8.0);
-                }
-            });
+                        ui.add_space(8.0);
+                    }
+                });
 
             if persist {
                 self.persist();
             }
             if let Some(id) = edit_id {
                 if let Some(alarm) = self.store.alarms.iter().find(|a| a.id == id).cloned() {
-                    self.editor_is_new = false;
-                    self.editor = Some(alarm);
+                    self.open_editor(alarm, false);
                 }
             }
             if let Some(id) = delete_id {
                 self.store.alarms.retain(|a| a.id != id);
+                self.pending.retain(|pending| *pending != id);
                 if self.ringing_id == Some(id) {
                     self.dismiss();
                 }
@@ -319,8 +399,11 @@ impl eframe::App for AlarumApp {
 
 impl AlarumApp {
     fn ringing_ui(&mut self, ui: &mut egui::Ui, id: Uuid, accent: Color32) {
+        let queued = self.pending.len();
         let alarm = self.store.alarms.iter().find(|a| a.id == id);
-        let title = alarm.map(|a| a.display_name()).unwrap_or_else(|| "Alarm".to_string());
+        let title = alarm
+            .map(|a| a.display_name())
+            .unwrap_or_else(|| "Alarm".to_string());
         let time = alarm
             .map(|a| a.time_label_for(self.store.use_12_hour))
             .unwrap_or_default();
@@ -330,18 +413,34 @@ impl AlarumApp {
             ui.add_space(36.0);
             ui.label(RichText::new("ALARM").size(14.0).color(accent).strong());
             ui.add_space(8.0);
-            ui.label(RichText::new(time).font(FontId::monospace(64.0)).color(Color32::WHITE).strong());
+            ui.label(
+                RichText::new(time)
+                    .font(FontId::monospace(64.0))
+                    .color(Color32::WHITE)
+                    .strong(),
+            );
             ui.add_space(12.0);
             ui.label(RichText::new(&title).size(28.0).color(Color32::from_rgb(240, 242, 248)));
+            if queued > 0 {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!("{queued} more waiting"))
+                        .size(14.0)
+                        .color(Color32::from_rgb(160, 164, 176)),
+                );
+            }
             ui.add_space(28.0);
             ui.horizontal(|ui| {
-                // Center the two buttons by using a dummy layout.
                 ui.add_space((ui.available_width() - 360.0).max(0.0) / 2.0);
                 if ui
                     .add_sized(
                         [170.0, 48.0],
-                        egui::Button::new(RichText::new(format!("Snooze  {snooze_min} min")).size(18.0).color(Color32::BLACK))
-                            .fill(accent),
+                        egui::Button::new(
+                            RichText::new(format!("Snooze  {snooze_min} min"))
+                                .size(18.0)
+                                .color(Color32::BLACK),
+                        )
+                        .fill(accent),
                     )
                     .clicked()
                 {
@@ -349,7 +448,10 @@ impl AlarumApp {
                 }
                 ui.add_space(16.0);
                 if ui
-                    .add_sized([170.0, 48.0], egui::Button::new(RichText::new("Dismiss").size(18.0)))
+                    .add_sized(
+                        [170.0, 48.0],
+                        egui::Button::new(RichText::new("Dismiss").size(18.0)),
+                    )
                     .clicked()
                 {
                     self.dismiss();
@@ -364,11 +466,16 @@ impl AlarumApp {
             return;
         }
 
-        let title = if self.editor_is_new { "New alarm" } else { "Edit alarm" };
+        let title = if self.editor_is_new {
+            "New alarm"
+        } else {
+            "Edit alarm"
+        };
         let mut save = false;
         let mut cancel = false;
         let mut browse = false;
         let mut preview = false;
+        let use_12 = self.store.use_12_hour;
 
         egui::Window::new(title)
             .collapsible(false)
@@ -378,96 +485,128 @@ impl AlarumApp {
             .show(ctx, |ui| {
                 if let Some(alarm) = self.editor.as_mut() {
                     ui.add_space(6.0);
-                    egui::Grid::new("editor_grid").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
-                        ui.label("Time");
-                        ui.horizontal(|ui| {
-                            if self.store.use_12_hour {
-                                let (mut hour12, mut is_pm) = model::to_12_hour(alarm.hour);
-                                ui.add(
-                                    egui::DragValue::new(&mut hour12)
-                                        .clamp_range(1..=12)
-                                        .custom_formatter(|n, _| format!("{}", n as u32)),
-                                );
-                                ui.label(":");
-                                ui.add(
-                                    egui::DragValue::new(&mut alarm.minute)
-                                        .clamp_range(0..=59)
-                                        .custom_formatter(|n, _| format!("{:02}", n as u32)),
-                                );
-                                egui::ComboBox::from_id_source("ampm")
-                                    .selected_text(if is_pm { "PM" } else { "AM" })
-                                    .width(52.0)
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(&mut is_pm, false, "AM");
-                                        ui.selectable_value(&mut is_pm, true, "PM");
-                                    });
-                                alarm.hour = model::to_24_hour(hour12, is_pm);
-                            } else {
-                                ui.add(
-                                    egui::DragValue::new(&mut alarm.hour)
-                                        .clamp_range(0..=23)
-                                        .custom_formatter(|n, _| format!("{:02}", n as u32)),
-                                );
-                                ui.label(":");
-                                ui.add(
-                                    egui::DragValue::new(&mut alarm.minute)
-                                        .clamp_range(0..=59)
-                                        .custom_formatter(|n, _| format!("{:02}", n as u32)),
-                                );
-                            }
-                        });
-                        ui.end_row();
-
-                        ui.label("Message");
-                        ui.add(egui::TextEdit::singleline(&mut alarm.label).desired_width(280.0).hint_text("Pick up kids from school"));
-                        ui.end_row();
-
-                        ui.label("Repeat");
-                        egui::ComboBox::from_id_source("repeat")
-                            .selected_text(alarm.repeat.label())
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut alarm.repeat, Repeat::Once, Repeat::Once.label());
-                                ui.selectable_value(&mut alarm.repeat, Repeat::Daily, Repeat::Daily.label());
-                                ui.selectable_value(&mut alarm.repeat, Repeat::Weekdays, Repeat::Weekdays.label());
-                                ui.selectable_value(&mut alarm.repeat, Repeat::Weekends, Repeat::Weekends.label());
-                            });
-                        ui.end_row();
-
-                        ui.label("Snooze");
-                        ui.add(egui::DragValue::new(&mut alarm.snooze_minutes).suffix(" minutes").clamp_range(1..=60));
-                        ui.end_row();
-
-                        ui.label("Sound");
-                        ui.vertical(|ui| {
-                            let mut use_default = alarm.sound_path.trim().is_empty();
-                            if ui.radio_value(&mut use_default, true, "Built-in default").changed() && use_default {
-                                alarm.sound_path.clear();
-                            }
-                            if ui.radio_value(&mut use_default, false, "Custom file").changed() && use_default {
-                                // switched back to default
-                                alarm.sound_path.clear();
-                            }
+                    egui::Grid::new("editor_grid")
+                        .num_columns(2)
+                        .spacing([16.0, 10.0])
+                        .show(ui, |ui| {
+                            ui.label("Time");
                             ui.horizontal(|ui| {
-                                ui.add_enabled(
-                                    !use_default,
-                                    egui::TextEdit::singleline(&mut alarm.sound_path)
-                                        .desired_width(220.0)
-                                        .hint_text("/path/to/sound.ogg"),
-                                );
-                                if ui.add_enabled(!use_default, egui::Button::new("Browse…")).clicked() {
-                                    browse = true;
+                                if use_12 {
+                                    let (mut hour12, mut is_pm) = model::to_12_hour(alarm.hour);
+                                    ui.add(
+                                        egui::DragValue::new(&mut hour12)
+                                            .clamp_range(1..=12)
+                                            .custom_formatter(|n, _| format!("{}", n as u32)),
+                                    );
+                                    ui.label(":");
+                                    ui.add(
+                                        egui::DragValue::new(&mut alarm.minute)
+                                            .clamp_range(0..=59)
+                                            .custom_formatter(|n, _| format!("{:02}", n as u32)),
+                                    );
+                                    egui::ComboBox::from_id_source("ampm")
+                                        .selected_text(if is_pm { "PM" } else { "AM" })
+                                        .width(52.0)
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(&mut is_pm, false, "AM");
+                                            ui.selectable_value(&mut is_pm, true, "PM");
+                                        });
+                                    alarm.hour = model::to_24_hour(hour12, is_pm);
+                                } else {
+                                    ui.add(
+                                        egui::DragValue::new(&mut alarm.hour)
+                                            .clamp_range(0..=23)
+                                            .custom_formatter(|n, _| format!("{:02}", n as u32)),
+                                    );
+                                    ui.label(":");
+                                    ui.add(
+                                        egui::DragValue::new(&mut alarm.minute)
+                                            .clamp_range(0..=59)
+                                            .custom_formatter(|n, _| format!("{:02}", n as u32)),
+                                    );
                                 }
                             });
-                            if ui.button("Test sound").clicked() {
-                                preview = true;
-                            }
-                        });
-                        ui.end_row();
+                            ui.end_row();
 
-                        ui.label("Enabled");
-                        ui.checkbox(&mut alarm.enabled, "");
-                        ui.end_row();
-                    });
+                            ui.label("Message");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut alarm.label)
+                                    .desired_width(280.0)
+                                    .hint_text("Pick up kids from school"),
+                            );
+                            ui.end_row();
+
+                            ui.label("Repeat");
+                            egui::ComboBox::from_id_source("repeat")
+                                .selected_text(alarm.repeat.label())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut alarm.repeat, Repeat::Once, Repeat::Once.label());
+                                    ui.selectable_value(&mut alarm.repeat, Repeat::Daily, Repeat::Daily.label());
+                                    ui.selectable_value(
+                                        &mut alarm.repeat,
+                                        Repeat::Weekdays,
+                                        Repeat::Weekdays.label(),
+                                    );
+                                    ui.selectable_value(
+                                        &mut alarm.repeat,
+                                        Repeat::Weekends,
+                                        Repeat::Weekends.label(),
+                                    );
+                                });
+                            ui.end_row();
+
+                            ui.label("Snooze");
+                            ui.add(
+                                egui::DragValue::new(&mut alarm.snooze_minutes)
+                                    .suffix(" minutes")
+                                    .clamp_range(1..=60),
+                            );
+                            ui.end_row();
+
+                            ui.label("Sound");
+                            ui.vertical(|ui| {
+                                if ui
+                                    .radio_value(&mut self.editor_custom_sound, false, "Built-in default")
+                                    .clicked()
+                                    && !alarm.sound_path.trim().is_empty()
+                                {
+                                    self.editor_stashed_sound = alarm.sound_path.clone();
+                                    alarm.sound_path.clear();
+                                }
+                                if ui
+                                    .radio_value(&mut self.editor_custom_sound, true, "Custom file")
+                                    .clicked()
+                                    && alarm.sound_path.trim().is_empty()
+                                {
+                                    alarm.sound_path = self.editor_stashed_sound.clone();
+                                }
+                                ui.horizontal(|ui| {
+                                    ui.add_enabled(
+                                        self.editor_custom_sound,
+                                        egui::TextEdit::singleline(&mut alarm.sound_path)
+                                            .desired_width(220.0)
+                                            .hint_text("/path/to/sound.ogg"),
+                                    );
+                                    if ui
+                                        .add_enabled(
+                                            self.editor_custom_sound,
+                                            egui::Button::new("Browse…"),
+                                        )
+                                        .clicked()
+                                    {
+                                        browse = true;
+                                    }
+                                });
+                                if ui.button("Test sound").clicked() {
+                                    preview = true;
+                                }
+                            });
+                            ui.end_row();
+
+                            ui.label("Enabled");
+                            ui.checkbox(&mut alarm.enabled, "");
+                            ui.end_row();
+                        });
 
                     ui.add_space(14.0);
                     ui.horizontal(|ui| {
@@ -488,12 +627,15 @@ impl AlarumApp {
             if let Some(path) = audio::pick_audio_file() {
                 if let Some(alarm) = self.editor.as_mut() {
                     alarm.sound_path = path.to_string_lossy().to_string();
+                    self.editor_custom_sound = true;
+                    self.editor_stashed_sound = alarm.sound_path.clone();
                 }
             }
         }
         if preview {
+            let use_custom = self.editor_custom_sound;
             if let Some(alarm) = self.editor.as_ref() {
-                let path = if alarm.sound_path.trim().is_empty() {
+                let path = if !use_custom || alarm.sound_path.trim().is_empty() {
                     None
                 } else {
                     Some(Path::new(alarm.sound_path.trim()))
@@ -507,6 +649,9 @@ impl AlarumApp {
                 alarm.minute = alarm.minute.min(59);
                 alarm.snooze_minutes = alarm.snooze_minutes.max(1);
                 alarm.snooze_until = None;
+                if !self.editor_custom_sound {
+                    alarm.sound_path.clear();
+                }
                 if let Some(existing) = self.store.alarms.iter_mut().find(|a| a.id == alarm.id) {
                     *existing = alarm;
                 } else {
