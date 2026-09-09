@@ -6,7 +6,7 @@ description = "A simple desktop alarm clock with sound, messages, and snooze"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/fibnas/alarum"
-categories = ["GUI"]
+categories = ["command-line-utilities"]
 keywords = ["gui", "clock", "organization", "productivity", "alarm"]
 exclude = ["target/", "entries.json", "screenshots/"]
 
