@@ -1,4 +1,4 @@
-use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Timelike, NaiveTime, TimeZone, Weekday};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveTime, TimeZone, Weekday};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -226,6 +226,7 @@ pub fn format_next(dt: DateTime<Local>, use_12_hour: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Timelike;
 
     fn at(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> DateTime<Local> {
         Local
